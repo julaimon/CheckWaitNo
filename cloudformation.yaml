@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: LINE Bot Stack with Webhook + Queue Checker + API Gateway + DynamoDB
+
+Parameters:
+  ChannelAccessToken:
+    Type: String
+    Description: LINE Channel Access Token
+  ChannelSecret:
+    Type: String
+    Description: LINE Channel Secret
+  BotId:
+    Type: String
+    Description: LINE Bot User ID
+  S3BucketName:
+    Type: String
+    Description: S3 bucket containing Lambda ZIPs
+  WebhookLambdaZip:
+    Type: String
+    Description: S3 key for Webhook Lambda ZIP
+  CheckerLambdaZip:
+    Type: String
+    Description: S3 key for Checker Lambda ZIP
+  DynamoDBTableName:
+    Type: String
+    Default: line_queue_watch
+    Description: DynamoDB table for queue watch
+
+Resources:
+
+  ####################################
+  # DynamoDB Table
+  ####################################
+  QueueWatchTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ####################################
+  # Lambda Execution Role
+  ####################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExtraPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: arn:aws:s3:::*  # optional, restrict to your bucket
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt QueueWatchTable.Arn
+
+  ####################################
+  # Webhook Lambda
+  ####################################
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: linebot-webhook
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          Channel_access_token: !Ref ChannelAccessToken
+          Channel_secret: !Ref ChannelSecret
+          bot_id: !Ref BotId
+          DYNAMO_TABLE: !Ref DynamoDBTableName
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref WebhookLambdaZip
+
+  ####################################
+  # Checker Lambda
+  ####################################
+  CheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: linebot-checker
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          Channel_access_token: !Ref ChannelAccessToken
+          Channel_secret: !Ref ChannelSecret
+          bot_id: !Ref BotId
+          DYNAMO_TABLE: !Ref DynamoDBTableName
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref CheckerLambdaZip
+
+  ####################################
+  # EventBridge Rule to trigger Checker Lambda every 2 minutes
+  ####################################
+  CheckerLambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: checker-lambda-schedule
+      ScheduleExpression: rate(2 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CheckerLambda.Arn
+          Id: "CheckerLambdaTarget"
+
+  CheckerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CheckerLambdaSchedule.Arn
+
+  ####################################
+  # API Gateway HTTP API
+  ####################################
+  LineBotApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: LineBotApi
+      ProtocolType: HTTP
+
+  WebhookLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref LineBotApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookLambda.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref LineBotApi
+      RouteKey: "POST /webhook"
+      Target: !Sub integrations/${WebhookLambdaIntegration}
+
+  WebhookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LineBotApi}/*/POST/webhook
+
+  WebhookApiDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    Properties:
+      ApiId: !Ref LineBotApi
+    DependsOn:
+      - WebhookRoute
+
+  WebhookStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref LineBotApi
+      DeploymentId: !Ref WebhookApiDeployment
+      StageName: prod
+      AutoDeploy: true
+
+Outputs:
+  WebhookUrl:
+    Description: URL for LINE Webhook
+    Value: !Sub https://${LineBotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook
