@@ -59,31 +59,57 @@ def lambda_handler(event, context):
                             message_list += f"晚珍\n一診: {room1}\n二診: {room2}\n"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=message_list or "目前無資料"))
 
-        elif ":" in user_msg:
-            # format: "診室:號碼"
-            try:
-                queue_room, queue_no = user_msg.split(':')
-                queue_room = queue_room.strip()
-                queue_no = int(queue_no.strip())
-
-                # store to DynamoDB
-                table.put_item(Item={
-                    'user_id': user_id,
-                    'room_no': queue_room,
-                    'queue_no': queue_no,
-                    'timestamp': int(__import__('time').time())
-                })
-
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(text=f"✅ 已登記通知：當 {queue_room} 診接近號碼 {queue_no} 時我會提醒你！")
-                )
-            except Exception as e:
-                print("Error parsing input:", e)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入格式如 3:120"))
+        elif user_msg == "提醒掛號號碼":
+            # Start registration process
+            table.put_item(Item={
+                'user_id': user_id,
+                'state': 'waiting_room',
+                'timestamp': int(__import__('time').time())
+            })
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請問要提醒哪個診室？"))
 
         else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=user_msg))
+            # Check if user is in the middle of registration
+            response = table.get_item(Key={'user_id': user_id})
+            item = response.get('Item')
+
+            if item and 'state' in item:
+                if item['state'] == 'waiting_room':
+                    # User replied with room number
+                    table.update_item(
+                        Key={'user_id': user_id},
+                        UpdateExpression="SET #s=:s, room_no=:r",
+                        ExpressionAttributeNames={'#s': 'state'},
+                        ExpressionAttributeValues={
+                            ':r': user_msg.strip(),
+                            ':s': 'waiting_number'
+                        }
+                    )
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入想要提醒的號碼"))
+
+                elif item['state'] == 'waiting_number':
+                    try:
+                        queue_no = int(user_msg.strip())
+                        room_no = item['room_no']
+
+                        # Store final reminder and clean up temporary state
+                        table.put_item(Item={
+                            'user_id': user_id,
+                            'room_no': room_no,
+                            'queue_no': queue_no,
+                            'timestamp': int(__import__('time').time())
+                        })
+                        table.delete_item(Key={'user_id': user_id})
+
+                        line_bot_api.reply_message(
+                            event.reply_token,
+                            TextSendMessage(text=f"✅ 已登記通知：當 {room_no} 診接近號碼 {queue_no} 時我會提醒你！")
+                        )
+                    except ValueError:
+                        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="請輸入有效號碼"))
+            else:
+                # Fallback echo
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=user_msg))
 
     try:
         handler.handle(body, signature)
